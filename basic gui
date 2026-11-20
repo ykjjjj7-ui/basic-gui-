@@ -1,0 +1,499 @@
+-- run the remote thing, don't assume what it returns
+pcall(function()
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/ykjjjj7-ui/gui-library-/refs/heads/main/gui%20library"))()
+end)
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local Workspace         = game:GetService("Workspace")
+local CoreGui           = game:GetService("CoreGui")
+
+local LP     = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+-- ============================ state ============================
+local State = {
+    Aimbot    = { Enabled = false, FOV = 120, Smooth = 0.35, TeamCheck = true, WallCheck = false, Part = "Head", Key = Enum.KeyCode.E },
+    Walkspeed = { Enabled = false, Value = 32 },
+    Fly       = { Enabled = false, Speed = 50 },
+    ESP       = { Enabled = false, Box = true, Name = true, Health = true, Distance = true, TeamCheck = true },
+}
+
+local AimbotHolding = false
+local FlyConn, FlyBV, FlyBG = nil, nil, nil
+local EspCache = {}
+
+-- ============================ helpers ============================
+local function getHum(plr)
+    local c = plr and plr.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+local function getHRP(plr)
+    local c = plr and plr.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+local function isAlive(plr)
+    local h = getHum(plr)
+    return h and h.Health > 0
+end
+local function sameTeam(plr, check)
+    if not check then return false end
+    return plr.Team ~= nil and plr.Team == LP.Team
+end
+local function toScreen(world)
+    local sp, on = Camera:WorldToViewportPoint(world)
+    return Vector2.new(sp.X, sp.Y), on
+end
+
+local rcParams = RaycastParams.new()
+rcParams.FilterType = Enum.RaycastFilterType.Exclude
+local function los(targetPart)
+    if not State.Aimbot.WallCheck then return true end
+    rcParams.FilterDescendantsInstances = { LP.Character, targetPart.Parent }
+    local origin = Camera.CFrame.Position
+    return Workspace:Raycast(origin, targetPart.Position - origin, rcParams) == nil
+end
+
+-- ============================ aimbot ============================
+local function findTarget()
+    local center, best, bestD = Camera.ViewportSize / 2, nil, State.Aimbot.FOV
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP and not sameTeam(plr, State.Aimbot.TeamCheck) and isAlive(plr) then
+            local part = plr.Character:FindFirstChild(State.Aimbot.Part)
+                          or plr.Character:FindFirstChild("HumanoidRootPart")
+            if part then
+                local sp, on = toScreen(part.Position)
+                if on then
+                    local d = (sp - center).Magnitude
+                    if d < bestD and los(part) then
+                        bestD, best = d, part
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+RunService.RenderStepped:Connect(function()
+    if not (State.Aimbot.Enabled and AimbotHolding) then return end
+    local t = findTarget()
+    if t then
+        Camera.CFrame = Camera.CFrame:Lerp(
+            CFrame.new(Camera.CFrame.Position, t.Position),
+            State.Aimbot.Smooth)
+    end
+end)
+
+UserInputService.InputBegan:Connect(function(i, gp)
+    if gp then return end
+    if i.KeyCode == State.Aimbot.Key then AimbotHolding = true end
+end)
+UserInputService.InputEnded:Connect(function(i)
+    if i.KeyCode == State.Aimbot.Key then AimbotHolding = false end
+end)
+
+-- ============================ walkspeed ============================
+local function applySpeed()
+    local h = getHum(LP)
+    if h then h.WalkSpeed = State.Walkspeed.Enabled and State.Walkspeed.Value or 16 end
+end
+LP.CharacterAdded:Connect(function() task.wait(1); applySpeed() end)
+
+-- ============================ fly ============================
+local function stopFly()
+    if FlyConn then FlyConn:Disconnect(); FlyConn = nil end
+    if FlyBV then FlyBV:Destroy(); FlyBV = nil end
+    if FlyBG then FlyBG:Destroy(); FlyBG = nil end
+    local h = getHum(LP); if h then h.PlatformStand = false end
+end
+
+local function startFly()
+    local hrp = getHRP(LP); if not hrp then return end
+    local h = getHum(LP); if h then h.PlatformStand = true end
+
+    FlyBV = Instance.new("BodyVelocity")
+    FlyBV.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+    FlyBV.Velocity = Vector3.zero
+    FlyBV.Parent = hrp
+
+    FlyBG = Instance.new("BodyGyro")
+    FlyBG.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+    FlyBG.P = 1e5
+    FlyBG.CFrame = Camera.CFrame
+    FlyBG.Parent = hrp
+
+    FlyConn = RunService.RenderStepped:Connect(function()
+        local curHRP = getHRP(LP)
+        if not curHRP or not FlyBV or not FlyBG then return end
+        local dir = Vector3.zero
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir += Camera.CFrame.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir -= Camera.CFrame.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir -= Camera.CFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir += Camera.CFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.yAxis end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then dir -= Vector3.yAxis end
+        if dir.Magnitude > 0 then dir = dir.Unit end
+        FlyBV.Velocity = dir * State.Fly.Speed
+        FlyBG.CFrame = Camera.CFrame
+    end)
+end
+
+-- ============================ ESP ============================
+local function makeESP(plr)
+    if plr == LP or EspCache[plr] then return end
+    local box       = Drawing.new("Square")  box.Thickness = 1  box.Filled = false  box.Color = Color3.fromRGB(0,255,120)  box.Visible = false
+    local name      = Drawing.new("Text")    name.Size = 14      name.Center = true  name.Outline = true  name.Color = Color3.new(1,1,1)  name.Visible = false
+    local healthBg  = Drawing.new("Square")  healthBg.Filled = true  healthBg.Color = Color3.new(0,0,0)      healthBg.Visible = false
+    local healthBar = Drawing.new("Square")  healthBar.Filled = true  healthBar.Color = Color3.fromRGB(0,255,0)  healthBar.Visible = false
+    local dist      = Drawing.new("Text")    dist.Size = 13      dist.Center = true  dist.Outline = true  dist.Color = Color3.fromRGB(200,200,200)  dist.Visible = false
+    EspCache[plr] = { Box = box, Name = name, HealthBg = healthBg, HealthBar = healthBar, Distance = dist }
+end
+
+local function clearESP(plr)
+    local e = EspCache[plr]; if not e then return end
+    for _, d in pairs(e) do d:Remove() end
+    EspCache[plr] = nil
+end
+
+for _, plr in ipairs(Players:GetPlayers()) do makeESP(plr) end
+Players.PlayerAdded:Connect(makeESP)
+Players.PlayerRemoving:Connect(clearESP)
+
+local function corners(hrp)
+    local minX, minY, maxX, maxY, any = math.huge, math.huge, -math.huge, -math.huge, false
+    for _, part in ipairs(hrp.Parent:GetChildren()) do
+        if part:IsA("BasePart") then
+            for _, sx in ipairs({-0.5, 0.5}) do
+            for _, sy in ipairs({-0.5, 0.5}) do
+            for _, sz in ipairs({-0.5, 0.5}) do
+                local w = part.CFrame * Vector3.new(part.Size.X*sx, part.Size.Y*sy, part.Size.Z*sz)
+                local sp, on = toScreen(w)
+                if on then
+                    any = true
+                    minX, maxX = math.min(minX, sp.X), math.max(maxX, sp.X)
+                    minY, maxY = math.min(minY, sp.Y), math.max(maxY, sp.Y)
+                end
+            end end end
+        end
+    end
+    if not any then return nil end
+    return Vector2.new(minX, minY), Vector2.new(maxX, maxY)
+end
+
+RunService.RenderStepped:Connect(function()
+    for plr, e in pairs(EspCache) do
+        local hrp, hum = getHRP(plr), getHum(plr)
+        if State.ESP.Enabled and hrp and hum and hum.Health > 0
+           and not sameTeam(plr, State.ESP.TeamCheck) then
+            local tl, br = corners(hrp)
+            if tl then
+                local w, h = br.X - tl.X, br.Y - tl.Y
+                local myPos = getHRP(LP) and getHRP(LP).Position
+                local d = myPos and (hrp.Position - myPos).Magnitude or 0
+
+                if State.ESP.Box then
+                    e.Box.Size = Vector2.new(w, h); e.Box.Position = tl; e.Box.Visible = true
+                else e.Box.Visible = false end
+
+                if State.ESP.Name then
+                    e.Name.Position = Vector2.new(tl.X + w/2, tl.Y - 16)
+                    e.Name.Text = plr.Name; e.Name.Visible = true
+                else e.Name.Visible = false end
+
+                if State.ESP.Health then
+                    local pct = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+                    local barH = h * pct
+                    e.HealthBg.Position  = Vector2.new(tl.X - 6, tl.Y)
+                    e.HealthBg.Size      = Vector2.new(3, h)
+                    e.HealthBar.Position = Vector2.new(tl.X - 6, tl.Y + (h - barH))
+                    e.HealthBar.Size     = Vector2.new(3, barH)
+                    e.HealthBar.Color    = Color3.fromRGB(255*(1-pct), 255*pct, 0)
+                    e.HealthBg.Visible = true; e.HealthBar.Visible = true
+                else e.HealthBg.Visible = false; e.HealthBar.Visible = false end
+
+                if State.ESP.Distance then
+                    e.Distance.Position = Vector2.new(tl.X + w/2, br.Y + 2)
+                    e.Distance.Text = string.format("[%d]", math.floor(d))
+                    e.Distance.Visible = true
+                else e.Distance.Visible = false end
+            else
+                for _, d in pairs(e) do d.Visible = false end
+            end
+        else
+            for _, d in pairs(e) do d.Visible = false end
+        end
+    end
+end)
+
+-- ============================ GUI ============================
+local gui = Instance.new("ScreenGui")
+gui.Name = "ollie_menu"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = (gethui and gethui()) or CoreGui
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(520, 360)
+main.Position = UDim2.new(0.5, -260, 0.5, -180)
+main.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+main.BorderSizePixel = 0
+main.Active = true
+main.Draggable = true
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+
+local stroke = Instance.new("UIStroke", main)
+stroke.Color = Color3.fromRGB(60, 60, 80)
+stroke.Thickness = 1
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 32)
+title.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+title.BorderSizePixel = 0
+title.Text = "  ollie — roblox"
+title.TextColor3 = Color3.fromRGB(200, 200, 220)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = main
+Instance.new("UICorner", title).CornerRadius = UDim.new(0, 8)
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.fromOffset(28, 28)
+closeBtn.Position = UDim2.new(1, -32, 0, 2)
+closeBtn.BackgroundColor3 = Color3.fromRGB(50, 30, 30)
+closeBtn.Text = "×"
+closeBtn.TextColor3 = Color3.fromRGB(230, 100, 100)
+closeBtn.TextSize = 16
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.Parent = title
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
+
+local body = Instance.new("Frame")
+body.Size = UDim2.new(1, 0, 1, -32)
+body.Position = UDim2.fromOffset(0, 32)
+body.BackgroundTransparency = 1
+body.Parent = main
+
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(0, 110, 1, 0)
+tabBar.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+tabBar.BorderSizePixel = 0
+tabBar.Parent = body
+Instance.new("UICorner", tabBar).CornerRadius = UDim.new(0, 8)
+
+local content = Instance.new("Frame")
+content.Size = UDim2.new(1, -122, 1, -12)
+content.Position = UDim2.fromOffset(116, 6)
+content.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+content.BorderSizePixel = 0
+content.Parent = body
+Instance.new("UICorner", content).CornerRadius = UDim.new(0, 8)
+
+local tabList = Instance.new("UIListLayout")
+tabList.Padding = UDim.new(0, 4)
+tabList.Parent = tabBar
+tabList.HorizontalAlignment = Enum.HorizontalAlignment.Center
+tabList.VerticalAlignment = Enum.VerticalAlignment.Top
+
+local tabPad = Instance.new("UIPadding", tabBar)
+tabPad.PaddingTop = UDim.new(0, 8)
+
+local pages = {}
+local function addTab(name, order)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -12, 0, 30)
+    btn.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+    btn.Text = name
+    btn.TextColor3 = Color3.fromRGB(180, 180, 200)
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = 13
+    btn.LayoutOrder = order
+    btn.Parent = tabBar
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+    local page = Instance.new("ScrollingFrame")
+    page.Size = UDim2.new(1, -12, 1, -12)
+    page.Position = UDim2.fromOffset(6, 6)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 4
+    page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    page.Parent = content
+    page.Visible = false
+
+    local list = Instance.new("UIListLayout", page)
+    list.Padding = UDim.new(0, 6)
+
+    pages[name] = page
+
+    btn.MouseButton1Click:Connect(function()
+        for _, p in pairs(pages) do p.Visible = false end
+        page.Visible = true
+        for _, b in ipairs(tabBar:GetChildren()) do
+            if b:IsA("TextButton") then
+                b.BackgroundColor3 = (b == btn) and Color3.fromRGB(40, 40, 52) or Color3.fromRGB(28, 28, 36)
+            end
+        end
+    end)
+
+    return page
+end
+
+local function makeToggle(parent, label, get, set)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -12, 0, 32)
+    row.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+    row.BorderSizePixel = 0
+    row.Parent = parent
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -70, 1, 0)
+    lbl.Position = UDim2.fromOffset(12, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = label
+    lbl.TextColor3 = Color3.fromRGB(200, 200, 220)
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = row
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.fromOffset(50, 22)
+    btn.Position = UDim2.new(1, -60, 0.5, -11)
+    btn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    btn.Text = "OFF"
+    btn.TextColor3 = Color3.fromRGB(160, 160, 180)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 12
+    btn.Parent = row
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+
+    local on = get()
+    local function render()
+        btn.BackgroundColor3 = on and Color3.fromRGB(40, 160, 90) or Color3.fromRGB(45, 45, 55)
+        btn.Text = on and "ON" or "OFF"
+        btn.TextColor3 = on and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(160, 160, 180)
+    end
+    render()
+    btn.MouseButton1Click:Connect(function()
+        on = not on
+        set(on)
+        render()
+    end)
+    return row
+end
+
+local function makeSlider(parent, label, min, max, get, set)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -12, 0, 54)
+    row.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+    row.BorderSizePixel = 0
+    row.Parent = parent
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -20, 0, 20)
+    lbl.Position = UDim2.fromOffset(12, 4)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = label .. ": " .. tostring(get())
+    lbl.TextColor3 = Color3.fromRGB(200, 200, 220)
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = row
+
+    local track = Instance.new("Frame")
+    track.Size = UDim2.new(1, -24, 0, 6)
+    track.Position = UDim2.new(0, 12, 1, -14)
+    track.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    track.BorderSizePixel = 0
+    track.Parent = row
+    Instance.new("UICorner", track).CornerRadius = UDim.new(0, 3)
+
+    local fill = Instance.new("Frame")
+    fill.BackgroundColor3 = Color3.fromRGB(90, 150, 255)
+    fill.BorderSizePixel = 0
+    fill.Size = UDim2.new((get() - min) / (max - min), 0, 1, 0)
+    fill.Parent = track
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(0, 3)
+
+    local function setFromX(x)
+        local rel = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+        local v = math.floor(min + rel * (max - min) + 0.5)
+        fill.Size = UDim2.new(rel, 0, 1, 0)
+        lbl.Text = label .. ": " .. tostring(v)
+        set(v)
+    end
+
+    track.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            setFromX(i.Position.X)
+            local conn
+            conn = UserInputService.InputChanged:Connect(function(inp)
+                if inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch then
+                    setFromX(inp.Position.X)
+                end
+            end)
+            UserInputService.InputEnded:Connect(function(inp)
+                if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+                    if conn then conn:Disconnect(); conn = nil end
+                end
+            end)
+        end
+    end)
+end
+
+local function makeButton(parent, label, onClick)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -12, 0, 30)
+    btn.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
+    btn.Text = label
+    btn.TextColor3 = Color3.fromRGB(220, 220, 240)
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = 13
+    btn.Parent = parent
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    btn.MouseButton1Click:Connect(onClick)
+    return btn
+end
+
+-- ============================ pages ============================
+local aimPage = addTab("Aimbot", 1)
+makeToggle(aimPage, "Enabled (hold key)", function() return State.Aimbot.Enabled end, function(v) State.Aimbot.Enabled = v end)
+makeToggle(aimPage, "Team Check",        function() return State.Aimbot.TeamCheck end, function(v) State.Aimbot.TeamCheck = v end)
+makeToggle(aimPage, "Wall Check",        function() return State.Aimbot.WallCheck end, function(v) State.Aimbot.WallCheck = v end)
+makeSlider(aimPage, "FOV",    20, 400, function() return State.Aimbot.FOV end, function(v) State.Aimbot.FOV = v end)
+makeSlider(aimPage, "Smooth", 1, 100, function() return math.floor(State.Aimbot.Smooth * 100) end, function(v) State.Aimbot.Smooth = v / 100 end)
+
+local movePage = addTab("Movement", 2)
+makeToggle(movePage, "Walkspeed", function() return State.Walkspeed.Enabled end, function(v) State.Walkspeed.Enabled = v; applySpeed() end)
+makeSlider(movePage, "Speed",    16, 500, function() return State.Walkspeed.Value end, function(v) State.Walkspeed.Value = v; if State.Walkspeed.Enabled then applySpeed() end end)
+makeToggle(movePage, "Fly", function() return State.Fly.Enabled end, function(v)
+    State.Fly.Enabled = v
+    if v then startFly() else stopFly() end
+end)
+makeSlider(movePage, "Fly Speed", 10, 500, function() return State.Fly.Speed end, function(v) State.Fly.Speed = v end)
+
+local espPage = addTab("ESP", 3)
+makeToggle(espPage, "ESP Enabled", function() return State.ESP.Enabled end, function(v) State.ESP.Enabled = v end)
+makeToggle(espPage, "Box",      function() return State.ESP.Box end,      function(v) State.ESP.Box = v end)
+makeToggle(espPage, "Name",     function() return State.ESP.Name end,     function(v) State.ESP.Name = v end)
+makeToggle(espPage, "Health",   function() return State.ESP.Health end,   function(v) State.ESP.Health = v end)
+makeToggle(espPage, "Distance", function() return State.ESP.Distance end, function(v) State.ESP.Distance = v end)
+makeToggle(espPage, "Team Check", function() return State.ESP.TeamCheck end, function(v) State.ESP.TeamCheck = v end)
+
+local miscPage = addTab("Misc", 4)
+makeButton(miscPage, "Kill Menu", function() gui:Destroy() end)
+makeButton(miscPage, "Re-apply Walkspeed", function() applySpeed() end)
+
+-- open on first tab
+for _, b in ipairs(tabBar:GetChildren()) do
+    if b:IsA("TextButton") then b.MouseButton1Click:Fire(); break end
+end
